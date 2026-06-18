@@ -1,13 +1,12 @@
 {
   "name": "play16-backend",
   "version": "1.0.0",
-  "description": "Backend API for Play16 super-app (Marketplace + Cash-Work)",
-  "main": "src/server.js",
-  "type": "commonjs",
+  "description": "Backend API pour Play16 (Marketplace + Cash-Work)",
+  "main": "server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "nodemon src/server.js",
-    "migrate": "node src/db/migrate.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "migrate": "node migrate.js"
   },
   "dependencies": {
     "express": "^4.19.2",
