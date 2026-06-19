@@ -1,5 +1,5 @@
 // ============================================================
-// PLAY16 — Point d'entrée serveur (Étape 3)
+// PLAY16 — Point d'entrée serveur (Étape 4 — Final)
 // ============================================================
 require('dotenv').config();
 const express = require('express');
@@ -12,12 +12,22 @@ const { seedDefaultSettings } = require('./routesSettings');
 const app = express();
 app.use(helmet());
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
 app.use(rateLimit({ windowMs: 15 * 60 * 1000, max: 300, standardHeaders: true }));
 
 // ── HEALTH CHECK ────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'play16-backend', version: '3.0', time: new Date().toISOString() });
+  res.json({
+    status: 'ok',
+    service: 'play16-backend',
+    version: '4.0',
+    time: new Date().toISOString(),
+    modules: [
+      'auth', 'products', 'orders', 'deliveries',
+      'cashwork', 'external-payments', 'superadmin',
+      'disputes', 'reports', 'settings', 'integrations'
+    ]
+  });
 });
 
 // ── ROUTES API ───────────────────────────────────────────────
@@ -28,10 +38,13 @@ app.use('/api/orders',            require('./routesOrders'));
 app.use('/api/deliveries',        require('./routesDeliveries'));
 app.use('/api/cashwork',          require('./routesCashWork'));
 app.use('/api/external-payments', require('./routesExternalPayments'));
+app.use('/api/superadmin',        require('./routesSuperAdmin'));
+app.use('/api/disputes',          require('./routesDisputes'));
+app.use('/api/reports',           require('./routesReports'));
 
 // ── GESTION D'ERREURS GLOBALE ───────────────────────────────
 app.use((err, req, res, next) => {
-  console.error('[ERROR]', err);
+  console.error('[ERROR]', err.message);
   res.status(500).json({ error: 'Erreur interne.' });
 });
 
@@ -41,12 +54,12 @@ async function start() {
   try {
     await ensureCatalogSeeded();
     await seedDefaultSettings();
-    console.log('[Boot] Play16 backend v3.0 initialisé.');
+    console.log('[Boot] Play16 backend v4.0 — tous les modules initialisés.');
   } catch (err) {
     console.error('[Boot] Erreur initialisation (non bloquant):', err.message);
   }
   app.listen(PORT, () => {
-    console.log(`[Boot] Play16 backend démarré sur le port ${PORT}`);
+    console.log(`[Boot] Play16 backend v4.0 démarré sur le port ${PORT}`);
   });
 }
 
