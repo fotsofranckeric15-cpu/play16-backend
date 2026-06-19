@@ -6,7 +6,7 @@
 -- ─────────────────────────────────────────────
 -- UTILISATEURS & RÔLES
 -- ─────────────────────────────────────────────
-CREATE TABLE users (
+CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     phone_number VARCHAR(20) UNIQUE NOT NULL,
     whatsapp_number VARCHAR(20),
@@ -26,7 +26,7 @@ CREATE TABLE users (
     deleted_at TIMESTAMPTZ                -- soft delete (droit à l'oubli)
 );
 
-CREATE TABLE admin_accounts (
+CREATE TABLE IF NOT EXISTS admin_accounts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     full_name VARCHAR(150) NOT NULL,
     role VARCHAR(30) NOT NULL,            -- super_admin|admin_ventes|admin_cashwork|admin_externe
@@ -39,7 +39,7 @@ CREATE TABLE admin_accounts (
 );
 
 -- Changement de mot de passe Super Admin (délai 32j configurable)
-CREATE TABLE password_change_requests (
+CREATE TABLE IF NOT EXISTS password_change_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     admin_id UUID REFERENCES admin_accounts(id),
     new_password_hash TEXT NOT NULL,
@@ -54,7 +54,7 @@ CREATE TABLE password_change_requests (
 );
 
 -- Sessions admin (traçabilité par personne, pas juste par poste)
-CREATE TABLE admin_sessions (
+CREATE TABLE IF NOT EXISTS admin_sessions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     admin_id UUID REFERENCES admin_accounts(id),
     whatsapp_number_used VARCHAR(20) NOT NULL,
@@ -63,7 +63,7 @@ CREATE TABLE admin_sessions (
     ip_address VARCHAR(45)
 );
 
-CREATE TABLE admin_session_actions (
+CREATE TABLE IF NOT EXISTS admin_session_actions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     session_id UUID REFERENCES admin_sessions(id),
     action_type VARCHAR(50) NOT NULL,     -- create_delivery|block_account|resolve_dispute|...
@@ -74,7 +74,7 @@ CREATE TABLE admin_session_actions (
 );
 
 -- Mode Supervision (Super Admin consulte l'écran d'un sous-admin)
-CREATE TABLE supervision_logs (
+CREATE TABLE IF NOT EXISTS supervision_logs (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     super_admin_id UUID REFERENCES admin_accounts(id),
     viewed_admin_id UUID REFERENCES admin_accounts(id),
@@ -85,7 +85,7 @@ CREATE TABLE supervision_logs (
 -- ─────────────────────────────────────────────
 -- CGU DYNAMIQUES
 -- ─────────────────────────────────────────────
-CREATE TABLE cgu_versions (
+CREATE TABLE IF NOT EXISTS cgu_versions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     version_number INTEGER NOT NULL,
     content TEXT NOT NULL,                -- vide tant que Super Admin n'a pas édité
@@ -97,7 +97,7 @@ CREATE TABLE cgu_versions (
 -- ─────────────────────────────────────────────
 -- MARKETPLACE — PRODUITS
 -- ─────────────────────────────────────────────
-CREATE TABLE products (
+CREATE TABLE IF NOT EXISTS products (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     supplier_id UUID REFERENCES users(id),
     name VARCHAR(200) NOT NULL,
@@ -114,7 +114,7 @@ CREATE TABLE products (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE product_variants (
+CREATE TABLE IF NOT EXISTS product_variants (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     product_id UUID REFERENCES products(id),
     color VARCHAR(50),
@@ -123,7 +123,7 @@ CREATE TABLE product_variants (
 );
 
 -- Historique des clics produit (analytics + anti-fraude)
-CREATE TABLE product_clicks (
+CREATE TABLE IF NOT EXISTS product_clicks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     product_id UUID REFERENCES products(id),
     user_id UUID REFERENCES users(id),    -- NULL si visiteur non connecté
@@ -132,7 +132,7 @@ CREATE TABLE product_clicks (
 );
 
 -- Validation des demandes de boost par Super Admin
-CREATE TABLE boost_requests (
+CREATE TABLE IF NOT EXISTS boost_requests (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     product_id UUID REFERENCES products(id),
     requested_level INTEGER NOT NULL,
@@ -145,7 +145,7 @@ CREATE TABLE boost_requests (
 -- ─────────────────────────────────────────────
 -- COMMANDES & LIVRAISONS
 -- ─────────────────────────────────────────────
-CREATE TABLE orders (
+CREATE TABLE IF NOT EXISTS orders (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     client_id UUID REFERENCES users(id),
     supplier_id UUID REFERENCES users(id),
@@ -157,7 +157,7 @@ CREATE TABLE orders (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE deliveries (
+CREATE TABLE IF NOT EXISTS deliveries (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     order_id UUID REFERENCES orders(id),
     delivery_person_id UUID REFERENCES users(id),
@@ -168,7 +168,7 @@ CREATE TABLE deliveries (
 );
 
 -- Position GPS du livreur — TOUJOURS visible admin/super admin
-CREATE TABLE delivery_locations (
+CREATE TABLE IF NOT EXISTS delivery_locations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     delivery_id UUID REFERENCES deliveries(id),
     latitude DOUBLE PRECISION NOT NULL,
@@ -182,7 +182,7 @@ CREATE TABLE delivery_locations (
 -- ─────────────────────────────────────────────
 -- CASHBACK & PARRAINAGE
 -- ─────────────────────────────────────────────
-CREATE TABLE cashback_transactions (
+CREATE TABLE IF NOT EXISTS cashback_transactions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),
     order_id UUID REFERENCES orders(id),
@@ -191,7 +191,7 @@ CREATE TABLE cashback_transactions (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE referrals (
+CREATE TABLE IF NOT EXISTS referrals (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     referrer_id UUID REFERENCES users(id),
     referred_id UUID REFERENCES users(id),
@@ -203,7 +203,7 @@ CREATE TABLE referrals (
 -- ─────────────────────────────────────────────
 -- QR CODE — LOTS DE RÉCOMPENSES (sécurité tirage)
 -- ─────────────────────────────────────────────
-CREATE TABLE qr_lots (
+CREATE TABLE IF NOT EXISTS qr_lots (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_by_super_admin_id UUID REFERENCES admin_accounts(id) NOT NULL,
     target_buyer_count INTEGER NOT NULL,
@@ -212,7 +212,7 @@ CREATE TABLE qr_lots (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE qr_lot_rewards (
+CREATE TABLE IF NOT EXISTS qr_lot_rewards (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     qr_lot_id UUID REFERENCES qr_lots(id),
     reward_type VARCHAR(50),              -- cash|item|credit
@@ -221,7 +221,7 @@ CREATE TABLE qr_lot_rewards (
 );
 
 -- Tirage : assignation immuable une fois faite (audit trail)
-CREATE TABLE qr_codes (
+CREATE TABLE IF NOT EXISTS qr_codes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     qr_lot_id UUID REFERENCES qr_lots(id),
     order_id UUID REFERENCES orders(id),  -- la commande qui a déclenché ce QR
@@ -235,7 +235,7 @@ CREATE TABLE qr_codes (
 -- ─────────────────────────────────────────────
 -- CASH-WORK
 -- ─────────────────────────────────────────────
-CREATE TABLE cash_work_posts (
+CREATE TABLE IF NOT EXISTS cash_work_posts (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     posted_by_user_id UUID REFERENCES users(id), -- client, fournisseur, cash-worker, admin tous possibles
     description TEXT NOT NULL,
@@ -247,7 +247,7 @@ CREATE TABLE cash_work_posts (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE cash_work_missions (
+CREATE TABLE IF NOT EXISTS cash_work_missions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     post_id UUID REFERENCES cash_work_posts(id),
     client_id UUID REFERENCES users(id),
@@ -263,7 +263,7 @@ CREATE TABLE cash_work_missions (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE cash_work_proof_media (
+CREATE TABLE IF NOT EXISTS cash_work_proof_media (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     mission_id UUID REFERENCES cash_work_missions(id),
     media_type VARCHAR(20),               -- photo|video
@@ -274,7 +274,7 @@ CREATE TABLE cash_work_proof_media (
 -- ─────────────────────────────────────────────
 -- PAIEMENT EXTERNE (hors plateforme, séquestre)
 -- ─────────────────────────────────────────────
-CREATE TABLE external_payments (
+CREATE TABLE IF NOT EXISTS external_payments (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     buyer_id UUID REFERENCES users(id),
     seller_whatsapp_number VARCHAR(20) NOT NULL,
@@ -292,7 +292,7 @@ CREATE TABLE external_payments (
     created_at TIMESTAMPTZ DEFAULT now()
 );
 
-CREATE TABLE external_payment_media (
+CREATE TABLE IF NOT EXISTS external_payment_media (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     external_payment_id UUID REFERENCES external_payments(id),
     media_type VARCHAR(30),  -- packing_video|shipping_proof|reception_video|return_shipping_proof
@@ -305,7 +305,7 @@ CREATE TABLE external_payment_media (
 -- ─────────────────────────────────────────────
 -- LITIGES (tous modules)
 -- ─────────────────────────────────────────────
-CREATE TABLE disputes (
+CREATE TABLE IF NOT EXISTS disputes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     module VARCHAR(20) NOT NULL,          -- sales|cashwork|external
     related_id UUID NOT NULL,             -- order_id / mission_id / external_payment_id
@@ -321,7 +321,7 @@ CREATE TABLE disputes (
 -- ─────────────────────────────────────────────
 -- BLOCAGE DE COMPTE (traçabilité permanente)
 -- ─────────────────────────────────────────────
-CREATE TABLE account_blocks (
+CREATE TABLE IF NOT EXISTS account_blocks (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID REFERENCES users(id),
     blocked_by_admin_id UUID REFERENCES admin_accounts(id) NOT NULL,
@@ -335,7 +335,7 @@ CREATE TABLE account_blocks (
 -- ─────────────────────────────────────────────
 -- INTÉGRATIONS — "TIROIR SIM"
 -- ─────────────────────────────────────────────
-CREATE TABLE settings_integrations (
+CREATE TABLE IF NOT EXISTS settings_integrations (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     provider_name VARCHAR(50) UNIQUE NOT NULL, -- campay|cinetpay|whatsapp_business|twilio|
                                                  -- firebase_push|sendgrid|google_maps|
@@ -350,7 +350,7 @@ CREATE TABLE settings_integrations (
 -- ─────────────────────────────────────────────
 -- PARAMÈTRES GLOBAUX CONFIGURABLES
 -- ─────────────────────────────────────────────
-CREATE TABLE platform_settings (
+CREATE TABLE IF NOT EXISTS platform_settings (
     key VARCHAR(100) PRIMARY KEY,
     value TEXT NOT NULL,
     description TEXT,

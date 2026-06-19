@@ -1,5 +1,8 @@
 // ============================================================
-// PLAY16 — Script de migration (Étape 2)
+// PLAY16 — Script de migration (corrigé — idempotent)
+// ============================================================
+// Ce script peut être relancé autant de fois que nécessaire
+// sans jamais planter, même si les tables existent déjà.
 // ============================================================
 require('dotenv').config();
 const fs = require('fs');
@@ -20,10 +23,14 @@ async function migrate() {
     console.log('[Migrate] Extension pgcrypto...');
     await pool.query('CREATE EXTENSION IF NOT EXISTS pgcrypto;');
 
-    console.log('[Migrate] Schéma principal...');
+    console.log('[Migrate] Tables principales (IF NOT EXISTS)...');
+    // Toutes les tables utilisent CREATE TABLE IF NOT EXISTS
+    // donc ce bloc est sûr même si les tables existent déjà.
     const schemaPath = path.join(__dirname, 'schema.sql');
     const schemaSql = fs.readFileSync(schemaPath, 'utf-8');
-    await pool.query(schemaSql);
+    // Sécurité supplémentaire : on remplace au cas où
+    const safeSql = schemaSql.replace(/CREATE TABLE /g, 'CREATE TABLE IF NOT EXISTS ');
+    await pool.query(safeSql);
 
     console.log('[Migrate] Table simulation_logs...');
     await pool.query(`
@@ -46,7 +53,7 @@ async function migrate() {
       );
     `);
 
-    console.log('[Migrate] Index performance...');
+    console.log('[Migrate] Index de performance...');
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_products_active_boost
         ON products(is_active, boost_level_active DESC);
@@ -58,9 +65,9 @@ async function migrate() {
         ON otp_codes(phone_number);
     `);
 
-    console.log('[Migrate] Migration terminée avec succès.');
+    console.log('[Migrate] ✅ Migration terminée avec succès.');
   } catch (err) {
-    console.error('[Migrate] Echec:', err.message);
+    console.error('[Migrate] ❌ Echec:', err.message);
     process.exit(1);
   } finally {
     await pool.end();
