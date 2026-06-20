@@ -1,5 +1,5 @@
 // ============================================================
-// PLAY16 — Point d'entrée serveur (Étape 4 — Final)
+// PLAY16 — Point d'entrée serveur (Version finale v4.1)
 // ============================================================
 require('dotenv').config();
 const express = require('express');
@@ -8,6 +8,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { ensureCatalogSeeded } = require('./integrationRegistry');
 const { seedDefaultSettings } = require('./routesSettings');
+const { seedFeatureFlags, requireFeature } = require('./routesFeatures');
 
 const app = express();
 app.use(helmet());
@@ -20,29 +21,43 @@ app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
     service: 'play16-backend',
-    version: '4.0',
+    version: '4.1',
     time: new Date().toISOString(),
-    modules: [
-      'auth', 'products', 'orders', 'deliveries',
-      'cashwork', 'external-payments', 'superadmin',
-      'disputes', 'reports', 'settings', 'integrations'
-    ]
   });
 });
 
-// ── ROUTES API ───────────────────────────────────────────────
-app.use('/api/auth',              require('./routesAuth'));
-app.use('/api/products',          require('./routesProducts'));
-app.use('/api/settings',          require('./routesSettings').router);
-app.use('/api/orders',            require('./routesOrders'));
-app.use('/api/deliveries',        require('./routesDeliveries'));
-app.use('/api/cashwork',          require('./routesCashWork'));
-app.use('/api/external-payments', require('./routesExternalPayments'));
-app.use('/api/superadmin',        require('./routesSuperAdmin'));
-app.use('/api/disputes',          require('./routesDisputes'));
-app.use('/api/reports',           require('./routesReports'));
+// ── ROUTES DE BASE (toujours actives) ───────────────────────
+app.use('/api/auth',     require('./routesAuth'));
+app.use('/api/products', require('./routesProducts'));
+app.use('/api/settings', require('./routesSettings').router);
+app.use('/api/features', require('./routesFeatures').router);
 
-// ── GESTION D'ERREURS GLOBALE ───────────────────────────────
+// ── ROUTES CONDITIONNELLES (désactivables par feature flag) ─
+
+// Commandes — toujours actives (fonctionnalité de base)
+app.use('/api/orders', require('./routesOrders'));
+
+// Livraisons — toujours actives
+app.use('/api/deliveries', require('./routesDeliveries'));
+
+// Cash-Work — désactivé en mode Store Review
+app.use('/api/cashwork',
+  requireFeature('cash_work_system'),
+  require('./routesCashWork')
+);
+
+// Paiement externe — désactivé en mode Store Review
+app.use('/api/external-payments',
+  requireFeature('external_payment_escrow'),
+  require('./routesExternalPayments')
+);
+
+// ── ROUTES ADMINISTRATION ────────────────────────────────────
+app.use('/api/superadmin', require('./routesSuperAdmin'));
+app.use('/api/disputes',   require('./routesDisputes'));
+app.use('/api/reports',    require('./routesReports'));
+
+// ── GESTION D'ERREURS GLOBALE ────────────────────────────────
 app.use((err, req, res, next) => {
   console.error('[ERROR]', err.message);
   res.status(500).json({ error: 'Erreur interne.' });
@@ -54,12 +69,13 @@ async function start() {
   try {
     await ensureCatalogSeeded();
     await seedDefaultSettings();
-    console.log('[Boot] Play16 backend v4.0 — tous les modules initialisés.');
+    await seedFeatureFlags();
+    console.log('[Boot] Play16 backend v4.1 — Feature flags initialisés.');
   } catch (err) {
     console.error('[Boot] Erreur initialisation (non bloquant):', err.message);
   }
   app.listen(PORT, () => {
-    console.log(`[Boot] Play16 backend v4.0 démarré sur le port ${PORT}`);
+    console.log(`[Boot] Play16 backend v4.1 démarré sur le port ${PORT}`);
   });
 }
 
