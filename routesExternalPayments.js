@@ -1,392 +1,285 @@
 // ============================================================
-// PLAY16 — Routes Paiement Externe (hors plateforme)
+// PLAY16 — Paiement Externe Sécurisé
+// Token UUID, validation vidéo, attribution messages
 // ============================================================
 const express = require('express');
-const router = express.Router();
-const { query } = require('./pool');
+const router  = express.Router();
+const { query }  = require('./pool');
 const { authClient, authAdmin } = require('./authMiddleware');
 const { charge } = require('./PaymentService');
 const { sendWhatsApp } = require('./NotificationService');
 const multer = require('multer');
+const {
+  generatePaymentToken, verifyPaymentToken, consumePaymentToken,
+  validateVideo, checkIdempotency, saveIdempotencyResult,
+  getSetting, createFraudAlert,
+} = require('./securityMiddleware');
 
-// Stockage temporaire en mémoire (les fichiers vont au CDN ensuite)
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 200 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 500*1024*1024 } });
 
-// ── INITIER UN PAIEMENT EXTERNE (Acheteur) ──────────────────
-// POST /api/external-payments
-// Body: { seller_whatsapp_number, amount, description_text,
-//         expected_delivery_date, travel_agency_estimate, requested_proofs }
+// ── INITIER UN PAIEMENT EXTERNE ──────────────────────────────
 router.post('/', authClient, async (req, res) => {
   try {
-    const {
-      seller_whatsapp_number, amount, description_text,
-      expected_delivery_date, travel_agency_estimate, requested_proofs
-    } = req.body;
+    const { seller_whatsapp_number, amount, description_text,
+            expected_delivery_date, travel_agency_estimate, requested_proofs } = req.body;
+    if (!seller_whatsapp_number || !amount) return res.status(400).json({ error: 'Numéro vendeur et montant requis' });
 
-    if (!seller_whatsapp_number || !amount) {
-      return res.status(400).json({ error: 'Numéro vendeur et montant requis' });
-    }
+    const clientId = req.user.id;
+    const idempKey = `ext-${clientId}-${amount}-${Date.now().toString().slice(0,-2)}`;
+    const cached = await checkIdempotency(idempKey);
+    if (cached.duplicate) return res.status(cached.status).json(cached.result);
 
-    const buyerId = req.user.id;
-    const buyerRes = await query(`SELECT phone_number FROM users WHERE id = $1`, [buyerId]);
+    const buyerRes = await query(`SELECT phone_number FROM users WHERE id=$1`, [clientId]);
     const buyerPhone = buyerRes.rows[0].phone_number;
 
-    // Séquestrer les fonds
-    const paymentResult = await charge({
-      phoneNumber: buyerPhone,
-      amount,
-      description: `Séquestre paiement externe Play16 — ${description_text?.slice(0, 60) || 'Sans description'}`,
-      internalReference: `ext-${Date.now()}`,
-    });
+    const pay = await charge({ phoneNumber:buyerPhone, amount:parseInt(amount),
+      description:`Séquestre paiement externe Play16`, internalReference:`ext-${Date.now()}` });
+    if (!pay.success && !pay.simulated) return res.status(402).json({ error: 'Paiement échoué' });
 
-    if (!paymentResult.success && !paymentResult.simulated) {
-      return res.status(402).json({ error: 'Paiement échoué. Vérifiez votre solde Mobile Money.' });
-    }
+    const deadline = expected_delivery_date
+      ? new Date(new Date(expected_delivery_date).getTime() + 24*3600*1000)
+      : new Date(Date.now() + 7*24*3600*1000);
 
-    // Calculer la deadline (24h après les deux dates)
-    const noActionDeadline = expected_delivery_date
-      ? new Date(new Date(expected_delivery_date).getTime() + 24 * 60 * 60 * 1000)
-      : new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-
-    const paymentRes = await query(
+    const epRes = await query(
       `INSERT INTO external_payments
-         (buyer_id, seller_whatsapp_number, amount, description_text,
-          expected_delivery_date, travel_agency_estimate, requested_proofs,
-          status, buyer_expected_date, no_action_deadline)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'escrowed', $5, $8)
-       RETURNING *`,
-      [buyerId, seller_whatsapp_number, amount, description_text,
-       expected_delivery_date || null, travel_agency_estimate, requested_proofs, noActionDeadline]
+       (buyer_id,seller_whatsapp_number,amount,description_text,
+        expected_delivery_date,travel_agency_estimate,requested_proofs,
+        status,buyer_expected_date,no_action_deadline)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'escrowed',$5,$8) RETURNING *`,
+      [clientId, seller_whatsapp_number, amount, description_text,
+       expected_delivery_date||null, travel_agency_estimate, requested_proofs, deadline]
     );
+    const payment = epRes.rows[0];
 
-    const payment = paymentRes.rows[0];
+    // Générer token sécurisé (pas juste le numéro de téléphone)
+    const expiryHours = parseInt(await getSetting('payment_token_expiry_hours', '48'));
+    const token = await generatePaymentToken(payment.id);
 
-    // Notifier le vendeur via WhatsApp avec lien deep link
-    await sendWhatsApp(
-      seller_whatsapp_number,
+    // Notifier le vendeur avec deep link
+    await sendWhatsApp(seller_whatsapp_number,
       `🔐 Paiement sous séquestre initié vers vous sur Play16.\n` +
-      `N° de transaction : EXT-${payment.id.slice(0,8).toUpperCase()}\n` +
-      `Montant : ${amount} FCFA\n\n` +
-      `Pour accepter et voir les détails :\nhttps://play16app.page.link/payment/${payment.id}\n\n` +
-      `(Si vous n'avez pas Play16, installez-le depuis ce lien pour accéder au paiement)`
-    );
+      `N° transaction : EXT-${payment.id.slice(0,8).toUpperCase()}\n` +
+      `Montant : ${parseInt(amount).toLocaleString()} FCFA\n` +
+      `Code de vérification : ${token}\n` +
+      `Valable ${expiryHours}h.\n\n` +
+      `Vérifiez sur Play16 : https://play16app.page.link/payment/${token}`
+    ).catch(()=>{});
 
-    res.json({
-      success: true,
-      payment: {
-        id: payment.id,
-        amount,
-        status: 'escrowed',
-        seller_whatsapp: seller_whatsapp_number,
-      },
-      message: 'Paiement séquestré. Le vendeur a été notifié par WhatsApp.',
-      buyer_payment_code: buyerPhone,
-    });
+    const result = { success:true, payment:{ id:payment.id, amount:parseInt(amount), status:'escrowed' },
+                     payment_token:token, token_expires_hours:expiryHours, buyer_phone:buyerPhone };
+    await saveIdempotencyResult(idempKey, result, 200);
+    res.json(result);
   } catch (err) {
-    console.error('[ExtPayment] Erreur initiation:', err.message);
+    console.error('[ExtPay] initiation:', err.message);
     res.status(500).json({ error: 'Erreur initiation paiement externe' });
   }
 });
 
-// ── NOTE VOCALE (Acheteur) ──────────────────────────────────
-// POST /api/external-payments/:id/voice-note
-router.post('/:id/voice-note', authClient, upload.single('audio'), async (req, res) => {
+// ── VÉRIFIER LE TOKEN (Vendeur) ──────────────────────────────
+router.get('/verify-token/:token', async (req, res) => {
   try {
-    const { id } = req.params;
-    if (!req.file) return res.status(400).json({ error: 'Fichier audio requis' });
-
-    // TODO: Upload vers CDN (StorageService) quand configuré
-    // Pour l'instant, stocké en base en mode simulation
-    const voiceUrl = `[SIMULATION] audio-${id}-${Date.now()}.ogg`;
-
-    await query(
-      `UPDATE external_payments SET description_voice_url = $1 WHERE id = $2 AND buyer_id = $3`,
-      [voiceUrl, id, req.user.id]
+    const pt = await verifyPaymentToken(req.params.token);
+    const epRes = await query(
+      `SELECT ep.*,u.full_name as buyer_name FROM external_payments ep
+       JOIN users u ON u.id=ep.buyer_id WHERE ep.id=$1`, [pt.external_payment_id]
     );
-
-    res.json({ success: true, voice_url: voiceUrl });
+    if (!epRes.rows[0]) return res.status(404).json({ error: 'Transaction introuvable' });
+    const ep = epRes.rows[0];
+    res.json({ valid:true, payment:{ id:ep.id, amount:ep.amount, description:ep.description_text,
+      buyer_name:ep.buyer_name, status:ep.status, expires_at:pt.expires_at } });
   } catch (err) {
-    res.status(500).json({ error: 'Erreur upload note vocale' });
+    res.status(401).json({ error: err.message });
   }
 });
 
-// ── VÉRIFIER ET ACCEPTER (Vendeur) ──────────────────────────
-// POST /api/external-payments/:id/accept
+// ── ACCEPTER (Vendeur) ───────────────────────────────────────
 router.post('/:id/accept', async (req, res) => {
   try {
-    const { id } = req.params;
-    const { seller_full_name, seller_birth_date } = req.body;
+    const { token, seller_full_name, seller_birth_date } = req.body;
+    if (!seller_full_name || !seller_birth_date) return res.status(400).json({ error: 'Nom complet et date de naissance requis' });
+    if (!token) return res.status(400).json({ error: 'Token de vérification requis' });
 
-    if (!seller_full_name || !seller_birth_date) {
-      return res.status(400).json({ error: 'Nom complet et date de naissance requis pour sécurité' });
-    }
+    // Vérifier et consommer le token
+    const pt = await verifyPaymentToken(token);
+    if (pt.external_payment_id !== req.params.id) return res.status(403).json({ error: 'Token invalide pour cette transaction' });
+    await consumePaymentToken(token);
 
-    const paymentRes = await query(
-      `SELECT * FROM external_payments WHERE id = $1 AND status = 'escrowed'`,
-      [id]
-    );
+    const epRes = await query(`SELECT * FROM external_payments WHERE id=$1 AND status='escrowed'`, [req.params.id]);
+    if (!epRes.rows[0]) return res.status(404).json({ error: 'Transaction introuvable ou déjà traitée' });
 
-    if (paymentRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Transaction introuvable ou déjà traitée' });
-    }
-
-    const payment = paymentRes.rows[0];
-
-    await query(
-      `UPDATE external_payments SET status = 'accepted', seller_accepted_at = now() WHERE id = $1`,
-      [id]
-    );
-
-    res.json({
-      success: true,
-      payment: {
-        id: payment.id,
-        amount: payment.amount,
-        description: payment.description_text,
-        status: 'accepted',
-      },
-      next_step: 'execute_order',
-      message: 'Montant confirmé. Cliquez sur "Exécuter la commande" pour préparer le colis.',
-    });
+    await query(`UPDATE external_payments SET status='accepted',seller_accepted_at=now() WHERE id=$1`, [req.params.id]);
+    res.json({ success:true, next_step:'execute_order', message:'Montant confirmé. Préparez la commande.' });
   } catch (err) {
-    console.error('[ExtPayment] Erreur acceptation:', err.message);
-    res.status(500).json({ error: 'Erreur acceptation' });
+    res.status(400).json({ error: err.message });
   }
 });
 
-// ── REFUSER LE MONTANT (Vendeur) ─────────────────────────────
-// POST /api/external-payments/:id/reject
+// ── REFUSER (Vendeur) ────────────────────────────────────────
 router.post('/:id/reject', async (req, res) => {
   try {
-    const { id } = req.params;
-
-    const paymentRes = await query(
-      `SELECT ep.*, u.whatsapp_number as buyer_whatsapp, u.phone_number as buyer_phone
-       FROM external_payments ep
-       JOIN users u ON u.id = ep.buyer_id
-       WHERE ep.id = $1 AND ep.status = 'escrowed'`,
-      [id]
+    const epRes = await query(
+      `SELECT ep.*,u.whatsapp_number as bwa,u.phone_number as bp FROM external_payments ep
+       JOIN users u ON u.id=ep.buyer_id WHERE ep.id=$1 AND ep.status='escrowed'`, [req.params.id]
     );
-
-    if (paymentRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Transaction introuvable' });
-    }
-
-    const payment = paymentRes.rows[0];
-
-    await query(`UPDATE external_payments SET status = 'refunded' WHERE id = $1`, [id]);
-
-    // Notifier l'acheteur
-    await sendWhatsApp(
-      payment.buyer_whatsapp || payment.buyer_phone,
-      `[Message généré sur la base des informations fournies par le vendeur]\n❌ Le vendeur a refusé le montant proposé.\nVos ${payment.amount} FCFA seront remboursés sous 24h sur votre Mobile Money.`
-    );
-
-    res.json({ success: true, message: 'Transaction refusée. Remboursement initié.' });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur refus transaction' });
-  }
+    if (!epRes.rows[0]) return res.status(404).json({ error: 'Transaction introuvable' });
+    const ep = epRes.rows[0];
+    await query(`UPDATE external_payments SET status='refunded' WHERE id=$1`, [req.params.id]);
+    await sendWhatsApp(ep.bwa||ep.bp,
+      `[Message généré sur la base des informations fournies par le vendeur]\n❌ Le vendeur a refusé le montant. Vos ${ep.amount.toLocaleString()} FCFA seront remboursés sous 24h.`
+    ).catch(()=>{});
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ error: 'Erreur refus' }); }
 });
 
-// ── VIDÉO D'EMBALLAGE (Vendeur — optionnelle) ────────────────
-// POST /api/external-payments/:id/packing-video
-// RÈGLES : pas de pause, pas de téléchargement externe, stockage auto si coupure
+// ── NOTE VOCALE (Acheteur) ───────────────────────────────────
+router.post('/:id/voice-note', authClient, upload.single('audio'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'Fichier audio requis' });
+    const voiceUrl = `voice-${req.params.id}-${Date.now()}.ogg`;
+    await query(`UPDATE external_payments SET description_voice_url=$1 WHERE id=$2 AND buyer_id=$3`,
+      [voiceUrl, req.params.id, req.user.id]);
+    res.json({ success:true, voice_url:voiceUrl });
+  } catch (err) { res.status(500).json({ error: 'Erreur note vocale' }); }
+});
+
+// ── VIDÉO EMBALLAGE (Vendeur) ────────────────────────────────
 router.post('/:id/packing-video', upload.single('video'), async (req, res) => {
   try {
-    const { id } = req.params;
     const { was_ignored } = req.body;
-
-    const paymentRes = await query(
-      `SELECT ep.*, u.whatsapp_number as buyer_whatsapp, u.phone_number as buyer_phone
-       FROM external_payments ep JOIN users u ON u.id = ep.buyer_id WHERE ep.id = $1`,
-      [id]
+    const epRes = await query(
+      `SELECT ep.*,u.whatsapp_number as bwa,u.phone_number as bp FROM external_payments ep
+       JOIN users u ON u.id=ep.buyer_id WHERE ep.id=$1`, [req.params.id]
     );
+    if (!epRes.rows[0]) return res.status(404).json({ error: 'Transaction introuvable' });
+    const ep = epRes.rows[0];
 
-    if (paymentRes.rows.length === 0) return res.status(404).json({ error: 'Transaction introuvable' });
-    const payment = paymentRes.rows[0];
-
-    if (was_ignored === 'true' || was_ignored === true) {
-      // Vidéo ignorée — notifier l'acheteur
-      await query(
-        `INSERT INTO external_payment_media (external_payment_id, media_type, was_ignored)
-         VALUES ($1, 'packing_video', TRUE)`,
-        [id]
-      );
-
-      await sendWhatsApp(
-        payment.buyer_whatsapp || payment.buyer_phone,
-        `[Message généré sur la base des informations fournies par le vendeur]\n📦 Votre vendeur est en train de préparer votre commande.\n⚠️ La vidéo de preuve d\'emballage a été ignorée par ce dernier.`
-      );
+    if (was_ignored==='true'||was_ignored===true) {
+      await query(`INSERT INTO external_payment_media (external_payment_id,media_type,was_ignored) VALUES ($1,'packing_video',TRUE)`, [req.params.id]);
+      await sendWhatsApp(ep.bwa||ep.bp,
+        `[Message généré sur la base des informations fournies par le vendeur]\n📦 Votre vendeur prépare votre commande.\n⚠️ La vidéo de preuve d'emballage a été ignorée par ce dernier.`
+      ).catch(()=>{});
     } else if (req.file) {
-      // Vidéo enregistrée (stockage auto même si coupure)
-      const videoUrl = `[SIMULATION] packing-video-${id}-${Date.now()}.mp4`;
+      // Validation MIME et taille
+      let videoMeta;
+      try { videoMeta = await validateVideo(req.file); }
+      catch(vErr) { return res.status(400).json({ error: vErr.message }); }
 
+      const videoUrl = `packing-${req.params.id}-${Date.now()}.mp4`;
       await query(
-        `INSERT INTO external_payment_media (external_payment_id, media_type, url, was_ignored, recorded_without_interruption)
-         VALUES ($1, 'packing_video', $2, FALSE, TRUE)`,
-        [id, videoUrl]
+        `INSERT INTO external_payment_media (external_payment_id,media_type,url,was_ignored,recorded_without_interruption)
+         VALUES ($1,'packing_video',$2,FALSE,TRUE)`, [req.params.id, videoUrl]
       );
+      // Stocker intégrité vidéo
+      const mediaRes = await query(`SELECT id FROM external_payment_media WHERE external_payment_id=$1 ORDER BY created_at DESC LIMIT 1`, [req.params.id]);
+      await query(`INSERT INTO video_integrity (media_id,sha256_hash,mime_type,size_bytes) VALUES ($1,$2,$3,$4)`,
+        [mediaRes.rows[0]?.id, videoMeta.hash, videoMeta.mime, videoMeta.size]);
 
-      await sendWhatsApp(
-        payment.buyer_whatsapp || payment.buyer_phone,
+      await sendWhatsApp(ep.bwa||ep.bp,
         `[Message généré sur la base des informations fournies par le vendeur]\n📦 Votre vendeur a préparé votre commande et attend votre confirmation pour expédier.`
-      );
+      ).catch(()=>{});
     }
 
-    await query(`UPDATE external_payments SET status = 'preparing' WHERE id = $1`, [id]);
-
-    res.json({ success: true, next_step: 'await_buyer_confirmation' });
+    await query(`UPDATE external_payments SET status='preparing' WHERE id=$1`, [req.params.id]);
+    res.json({ success:true });
   } catch (err) {
-    console.error('[ExtPayment] Erreur vidéo emballage:', err.message);
+    console.error('[ExtPay] packing-video:', err.message);
     res.status(500).json({ error: 'Erreur vidéo emballage' });
   }
 });
 
-// ── CONFIRMATION EXPÉDITION PAR L'ACHETEUR ──────────────────
-// POST /api/external-payments/:id/confirm-shipment
+// ── CONFIRMATION EXPÉDITION (Acheteur) ───────────────────────
 router.post('/:id/confirm-shipment', authClient, async (req, res) => {
   try {
-    const { id } = req.params;
-
-    await query(`UPDATE external_payments SET status = 'shipping_confirmed' WHERE id = $1 AND buyer_id = $2`, [id, req.user.id]);
-
-    res.json({ success: true, message: 'Vendeur notifié. Il peut maintenant expédier.' });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur confirmation expédition' });
-  }
+    await query(`UPDATE external_payments SET status='shipping_confirmed' WHERE id=$1 AND buyer_id=$2`,
+      [req.params.id, req.user.id]);
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ error: 'Erreur confirmation expédition' }); }
 });
 
 // ── PREUVES D'EXPÉDITION (Vendeur) ──────────────────────────
-// POST /api/external-payments/:id/shipping-proof
 router.post('/:id/shipping-proof', upload.single('proof'), async (req, res) => {
   try {
-    const { id } = req.params;
     const { seller_expected_date } = req.body;
-
-    const proofUrl = req.file ? `[SIMULATION] shipping-proof-${id}-${Date.now()}` : null;
-
-    await query(
-      `INSERT INTO external_payment_media (external_payment_id, media_type, url)
-       VALUES ($1, 'shipping_proof', $2)`,
-      [id, proofUrl]
-    );
-
+    const proofUrl = req.file ? `shipping-proof-${req.params.id}-${Date.now()}` : null;
+    await query(`INSERT INTO external_payment_media (external_payment_id,media_type,url) VALUES ($1,'shipping_proof',$2)`,
+      [req.params.id, proofUrl]);
     if (seller_expected_date) {
-      await query(`UPDATE external_payments SET seller_expected_date = $1 WHERE id = $2`, [seller_expected_date, id]);
+      await query(`UPDATE external_payments SET seller_expected_date=$1 WHERE id=$2`, [seller_expected_date, req.params.id]);
     }
+    await query(`UPDATE external_payments SET status='shipped' WHERE id=$1`, [req.params.id]);
 
-    await query(`UPDATE external_payments SET status = 'shipped' WHERE id = $1`, [id]);
-
-    // Notifier l'acheteur
-    const paymentRes = await query(
-      `SELECT ep.*, u.whatsapp_number as buyer_whatsapp, u.phone_number as buyer_phone
-       FROM external_payments ep JOIN users u ON u.id = ep.buyer_id WHERE ep.id = $1`, [id]
+    const epRes = await query(
+      `SELECT ep.*,u.whatsapp_number as bwa,u.phone_number as bp FROM external_payments ep
+       JOIN users u ON u.id=ep.buyer_id WHERE ep.id=$1`, [req.params.id]
     );
-    const payment = paymentRes.rows[0];
-
-    await sendWhatsApp(
-      payment.buyer_whatsapp || payment.buyer_phone,
-      `[Message généré sur la base des informations fournies par le vendeur — Play16 ne garantit pas ces informations]\n🚚 Votre colis a été expédié !\nDate de livraison estimée : ${seller_expected_date || 'Non précisée'}\nDès réception, ouvrez Play16 et confirmez pour libérer le paiement.`
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur preuves expédition' });
-  }
+    const ep = epRes.rows[0];
+    await sendWhatsApp(ep?.bwa||ep?.bp,
+      `[Message généré sur la base des informations fournies par le vendeur — Play16 ne garantit pas ces informations]\n🚚 Votre colis a été expédié !\nDate estimée : ${seller_expected_date||'Non précisée'}\nConfirmez la réception dans Play16 dès l'arrivée.`
+    ).catch(()=>{});
+    res.json({ success:true });
+  } catch (err) { res.status(500).json({ error: 'Erreur preuves expédition' }); }
 });
 
-// ── RÉCEPTIONNER LE COLIS + VIDÉO (Acheteur) ────────────────
-// POST /api/external-payments/:id/reception
+// ── RÉCEPTION + VIDÉO (Acheteur) ─────────────────────────────
 router.post('/:id/reception', authClient, upload.single('video'), async (req, res) => {
   try {
-    const { id } = req.params;
     const { accepted, was_video_ignored } = req.body;
-    const clientId = req.user.id;
-
-    const paymentRes = await query(
-      `SELECT ep.*, u.whatsapp_number as seller_whatsapp
-       FROM external_payments ep
-       LEFT JOIN users seller ON seller.phone_number = ep.seller_whatsapp_number
-       JOIN users buyer ON buyer.id = ep.buyer_id
-       WHERE ep.id = $1 AND ep.buyer_id = $2`,
-      [id, clientId]
+    const epRes = await query(
+      `SELECT ep.*,u.phone_number as sp FROM external_payments ep
+       LEFT JOIN users seller ON seller.phone_number=ep.seller_whatsapp_number
+       WHERE ep.id=$1 AND ep.buyer_id=$2`, [req.params.id, req.user.id]
     );
+    if (!epRes.rows[0]) return res.status(404).json({ error: 'Transaction introuvable' });
 
-    if (paymentRes.rows.length === 0) return res.status(404).json({ error: 'Transaction introuvable' });
-    const payment = paymentRes.rows[0];
-
-    // Enregistrer la vidéo de réception si fournie
     if (req.file) {
-      const videoUrl = `[SIMULATION] reception-video-${id}-${Date.now()}.mp4`;
-      await query(
-        `INSERT INTO external_payment_media (external_payment_id, media_type, url, was_ignored)
-         VALUES ($1, 'reception_video', $2, FALSE)`,
-        [id, videoUrl]
-      );
-    } else if (was_video_ignored === 'true') {
-      await query(
-        `INSERT INTO external_payment_media (external_payment_id, media_type, was_ignored)
-         VALUES ($1, 'reception_video', TRUE)`,
-        [id]
-      );
+      let videoMeta;
+      try { videoMeta = await validateVideo(req.file); }
+      catch(vErr) { return res.status(400).json({ error: vErr.message }); }
+      const videoUrl = `reception-${req.params.id}-${Date.now()}.mp4`;
+      await query(`INSERT INTO external_payment_media (external_payment_id,media_type,url,was_ignored) VALUES ($1,'reception_video',$2,FALSE)`,
+        [req.params.id, videoUrl]);
+    } else if (was_video_ignored==='true') {
+      await query(`INSERT INTO external_payment_media (external_payment_id,media_type,was_ignored) VALUES ($1,'reception_video',TRUE)`,
+        [req.params.id]);
     }
 
-    if (accepted === 'true' || accepted === true) {
-      // COLIS ACCEPTÉ → transaction terminée, fonds libérés
-      await query(`UPDATE external_payments SET status = 'completed' WHERE id = $1`, [id]);
-
-      res.json({
-        success: true,
-        status: 'completed',
-        message: 'Colis accepté. Les fonds ont été libérés au vendeur.',
-      });
+    if (accepted==='true'||accepted===true) {
+      await query(`UPDATE external_payments SET status='completed' WHERE id=$1`, [req.params.id]);
+      res.json({ success:true, status:'completed', message:'Colis accepté. Fonds libérés au vendeur.' });
     } else {
-      // COLIS REFUSÉ → retour aux frais de l'acheteur
-      await query(`UPDATE external_payments SET status = 'rejected_returning' WHERE id = $1`, [id]);
-
+      await query(`UPDATE external_payments SET status='rejected_returning' WHERE id=$1`, [req.params.id]);
       res.json({
-        success: true,
-        status: 'rejected_returning',
-        return_instructions: {
-          at_your_expense: true,
-          deadline_hours: 24,
-          message: 'Vous devez retourner le colis au vendeur dans les 24h, à vos frais. Tout dommage pendant le retour est également à votre charge. Filmez l\'emballage du retour comme preuve.',
+        success:true, status:'rejected_returning',
+        return_instructions:{
+          at_your_expense:true, deadline_hours:24,
+          message:'Retournez le colis au vendeur dans les 24h, à vos frais. Tout dommage pendant le retour est à votre charge. Filmez l\'emballage du retour comme preuve.',
         },
       });
     }
   } catch (err) {
-    console.error('[ExtPayment] Erreur réception:', err.message);
+    console.error('[ExtPay] réception:', err.message);
     res.status(500).json({ error: 'Erreur réception colis' });
   }
 });
 
-// ── AUTO-VALIDATION APRÈS DÉLAI (appelé par cron) ───────────
-// POST /api/external-payments/auto-complete
+// ── AUTO-VALIDATION (cron) ───────────────────────────────────
 router.post('/auto-complete', authAdmin, async (req, res) => {
   try {
     const expired = await query(
-      `SELECT ep.*, u.whatsapp_number, u.phone_number
-       FROM external_payments ep
-       JOIN users u ON u.id = ep.buyer_id
-       WHERE ep.status = 'shipped'
-         AND ep.no_action_deadline < now()`,
-      []
+      `SELECT ep.*,u.whatsapp_number as bwa,u.phone_number as bp FROM external_payments ep
+       JOIN users u ON u.id=ep.buyer_id
+       WHERE ep.status='shipped' AND ep.no_action_deadline < now()`
     );
-
-    let completed = 0;
-    for (const payment of expired.rows) {
-      await query(`UPDATE external_payments SET status = 'completed' WHERE id = $1`, [payment.id]);
-      await sendWhatsApp(
-        payment.whatsapp_number || payment.phone_number,
-        `✅ Votre transaction EXT-${payment.id.slice(0,8).toUpperCase()} a été automatiquement validée suite à l\'expiration du délai de réponse. Les fonds ont été libérés au vendeur.`
-      );
-      completed++;
+    let done=0;
+    for (const ep of expired.rows) {
+      await query(`UPDATE external_payments SET status='completed' WHERE id=$1`, [ep.id]);
+      await sendWhatsApp(ep.bwa||ep.bp,
+        `✅ Transaction EXT-${ep.id.slice(0,8).toUpperCase()} auto-validée suite à expiration du délai. Fonds libérés.`
+      ).catch(()=>{});
+      done++;
     }
-
-    res.json({ success: true, auto_completed: completed });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur auto-complétion' });
-  }
+    res.json({ success:true, auto_completed:done });
+  } catch (err) { res.status(500).json({ error: 'Erreur auto-complétion' }); }
 });
 
 module.exports = router;

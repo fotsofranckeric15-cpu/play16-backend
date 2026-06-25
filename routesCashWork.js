@@ -1,343 +1,213 @@
 // ============================================================
-// PLAY16 — Routes Cash-Work
+// PLAY16 — Routes Cash-Work (version sécurisée)
+// Anti auto-achat, plafond facture, GPS mission uniquement
 // ============================================================
 const express = require('express');
-const router = express.Router();
+const router  = express.Router();
 const { query } = require('./pool');
 const { authClient, authAdmin } = require('./authMiddleware');
 const { charge } = require('./PaymentService');
-const { sendWhatsApp, sendPush } = require('./NotificationService');
+const { sendWhatsApp } = require('./NotificationService');
+const { checkNotOwnPost, checkCashworkInvoiceLimit } = require('./securityMiddleware');
 
-// ── PUBLIER UNE ANNONCE CASH-WORK ───────────────────────────
-// POST /api/cashwork/posts
-// Accessible à TOUS les profils (client, fournisseur, cash-worker, admin)
-// Body: { description, location_lat, location_lng }
+const CATEGORIES = {
+  nettoyage:['nettoyage','ménage','balayer','laver'],
+  electricite:['électri','câble','courant','prise'],
+  plomberie:['plomberie','tuyau','robinet','fuite'],
+  peinture:['peinture','peindre'],
+  informatique:['informatique','ordinateur','réseau','wifi'],
+  demenagement:['déménage','transport','porter'],
+  jardinage:['jardinage','gazon','plante'],
+  cuisine:['cuisine','chef','repas','traiteur'],
+  livraison:['livraison','colis','course'],
+};
+
+function detectCategory(desc) {
+  const d = desc.toLowerCase();
+  for (const [cat, kw] of Object.entries(CATEGORIES)) {
+    if (kw.some(k => d.includes(k))) return cat;
+  }
+  return 'divers';
+}
+
+// ── PUBLIER UNE ANNONCE ──────────────────────────────────────
 router.post('/posts', authClient, async (req, res) => {
   try {
     const { description, location_lat, location_lng } = req.body;
     if (!description) return res.status(400).json({ error: 'Description requise' });
 
-    // Détection automatique de catégorie basée sur mots-clés
     const category = detectCategory(description);
-
-    const postRes = await query(
-      `INSERT INTO cash_work_posts (posted_by_user_id, description, category, location_lat, location_lng)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [req.user.id, description, category, location_lat || null, location_lng || null]
+    const post = await query(
+      `INSERT INTO cash_work_posts (posted_by_user_id,description,category,location_lat,location_lng)
+       VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [req.user.id, description, category, location_lat||null, location_lng||null]
     );
 
-    // Chercher des prestataires disponibles dans la zone
-    const workers = await findAvailableWorkers(category, location_lat, location_lng);
-
-    if (workers.length > 0) {
-      // Notifier les prestataires disponibles
-      for (const worker of workers.slice(0, 3)) {
-        await sendWhatsApp(
-          worker.whatsapp_number || worker.phone_number,
-          `🔔 Nouvelle mission disponible près de vous !\nCatégorie : ${category}\nDescription : ${description.slice(0, 100)}...\nOuvrez Play16 pour accepter.`
-        );
-      }
+    const workers = await query(
+      `SELECT phone_number,whatsapp_number FROM users WHERE is_cash_worker=TRUE LIMIT 5`
+    );
+    for (const w of workers.rows) {
+      await sendWhatsApp(w.whatsapp_number||w.phone_number,
+        `🔔 Nouvelle mission Cash-Work !\nCatégorie: ${category}\n${description.slice(0,100)}...\nOuvrez Play16 pour accepter.`
+      ).catch(()=>{});
     }
 
-    res.json({
-      success: true,
-      post: postRes.rows[0],
-      workers_notified: workers.length,
-      message: workers.length > 0
-        ? `${workers.length} prestataire(s) notifié(s). En attente d'acceptation.`
-        : 'Annonce publiée dans le tableau public. Vous serez notifié dès qu\'un prestataire accepte.',
-    });
+    res.json({ success:true, post:post.rows[0], workers_notified:workers.rows.length });
   } catch (err) {
-    console.error('[CashWork] Erreur publication:', err.message);
     res.status(500).json({ error: 'Erreur publication annonce' });
   }
 });
 
-// ── TABLEAU PUBLIC DES ANNONCES ──────────────────────────────
-// GET /api/cashwork/posts
+// ── TABLEAU PUBLIC ───────────────────────────────────────────
 router.get('/posts', authClient, async (req, res) => {
   try {
-    const { category, page = 1 } = req.query;
-    const limit = 20;
-    const offset = (page - 1) * limit;
-
-    let where = `WHERE cp.status = 'open'`;
-    const params = [];
-
-    if (category) { params.push(category); where += ` AND cp.category = $${params.length}`; }
-
-    const result = await query(
-      `SELECT cp.*, u.full_name as posted_by_name
-       FROM cash_work_posts cp
-       JOIN users u ON u.id = cp.posted_by_user_id
-       ${where}
-       ORDER BY cp.created_at DESC
-       LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-      [...params, limit, offset]
+    const { category, page=1 } = req.query;
+    const limit=20, offset=(page-1)*limit;
+    let where=`WHERE cp.status='open'`; const params=[];
+    if (category) { params.push(category); where+=` AND cp.category=$${params.length}`; }
+    const r = await query(
+      `SELECT cp.*,u.full_name as posted_by_name FROM cash_work_posts cp
+       JOIN users u ON u.id=cp.posted_by_user_id
+       ${where} ORDER BY cp.created_at DESC
+       LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+      [...params,limit,offset]
     );
-
-    res.json({ posts: result.rows, page: parseInt(page) });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur chargement annonces' });
-  }
+    res.json({ posts:r.rows, page:parseInt(page) });
+  } catch (err) { res.status(500).json({ error: 'Erreur annonces' }); }
 });
 
-// ── ACCEPTER UNE ANNONCE (Cash-Worker) ──────────────────────
-// POST /api/cashwork/posts/:id/accept
+// ── ACCEPTER UNE ANNONCE (avec vérification anti-auto-achat) ─
 router.post('/posts/:id/accept', authClient, async (req, res) => {
   try {
     const { id } = req.params;
     const workerId = req.user.id;
 
+    // SÉCURITÉ : interdire d'accepter sa propre annonce
+    await checkNotOwnPost(id, workerId);
+
     const postRes = await query(
-      `SELECT cp.*, u.whatsapp_number as client_whatsapp, u.phone_number as client_phone,
-              u.full_name as client_name
-       FROM cash_work_posts cp
-       JOIN users u ON u.id = cp.posted_by_user_id
-       WHERE cp.id = $1 AND cp.status = 'open'`,
-      [id]
+      `SELECT cp.*,u.whatsapp_number as cwha,u.phone_number as cp FROM cash_work_posts cp
+       JOIN users u ON u.id=cp.posted_by_user_id WHERE cp.id=$1 AND cp.status='open'`, [id]
     );
-
-    if (postRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Annonce introuvable ou déjà prise' });
-    }
-
+    if (!postRes.rows[0]) return res.status(404).json({ error: 'Annonce introuvable ou déjà prise' });
     const post = postRes.rows[0];
 
-    // Créer la mission
-    const missionRes = await query(
-      `INSERT INTO cash_work_missions (post_id, client_id, worker_id, status)
-       VALUES ($1, $2, $3, 'pending_invoice')
-       RETURNING *`,
+    const mission = await query(
+      `INSERT INTO cash_work_missions (post_id,client_id,worker_id,status) VALUES ($1,$2,$3,'pending_invoice') RETURNING *`,
       [id, post.posted_by_user_id, workerId]
     );
+    await query(`UPDATE cash_work_posts SET status='matched' WHERE id=$1`, [id]);
 
-    // Marquer l'annonce comme matched
-    await query(`UPDATE cash_work_posts SET status = 'matched' WHERE id = $1`, [id]);
+    await sendWhatsApp(post.cwha||post.cp,
+      `✅ Un prestataire a accepté votre mission Cash-Work !\nCatégorie: ${post.category}\n\n⚠️ IMPORTANT : Tout paiement DOIT se faire via Play16. Tout paiement hors plateforme vous engage personnellement et échappe à notre protection.`
+    ).catch(()=>{});
 
-    // Notifier le client
-    await sendWhatsApp(
-      post.client_whatsapp || post.client_phone,
-      `✅ Un prestataire a accepté votre mission Cash-Work !\nCatégorie : ${post.category}\nIl vous contactera bientôt pour convenir des détails.\n⚠️ IMPORTANT : Tout paiement doit être effectué via Play16. Tout paiement hors plateforme échappe à notre contrôle et engage votre responsabilité.`
-    );
-
-    res.json({ success: true, mission: missionRes.rows[0] });
+    res.json({ success:true, mission:mission.rows[0] });
   } catch (err) {
-    console.error('[CashWork] Erreur acceptation:', err.message);
-    res.status(500).json({ error: 'Erreur acceptation annonce' });
+    if (err.message.includes('propre annonce')) return res.status(403).json({ error: err.message });
+    res.status(500).json({ error: 'Erreur acceptation' });
   }
 });
 
-// ── SOUMETTRE UNE FACTURE (Cash-Worker) ─────────────────────
-// POST /api/cashwork/missions/:id/invoice
-// Body: { amount }
+// ── SOUMETTRE FACTURE (avec plafond) ─────────────────────────
 router.post('/missions/:id/invoice', authClient, async (req, res) => {
   try {
-    const { id } = req.params;
     const { amount } = req.body;
+    if (!amount || amount<=0) return res.status(400).json({ error: 'Montant invalide' });
 
-    if (!amount || amount <= 0) return res.status(400).json({ error: 'Montant invalide' });
-
-    const missionRes = await query(
-      `SELECT cm.*, u.whatsapp_number as client_whatsapp, u.phone_number as client_phone
+    const mRes = await query(
+      `SELECT cm.*,u.whatsapp_number as cwha,u.phone_number as cp,cp2.category
        FROM cash_work_missions cm
-       JOIN users u ON u.id = cm.client_id
-       WHERE cm.id = $1 AND cm.worker_id = $2 AND cm.status = 'pending_invoice'`,
-      [id, req.user.id]
+       JOIN users u ON u.id=cm.client_id
+       JOIN cash_work_posts cp2 ON cp2.id=cm.post_id
+       WHERE cm.id=$1 AND cm.worker_id=$2 AND cm.status='pending_invoice'`,
+      [req.params.id, req.user.id]
     );
+    if (!mRes.rows[0]) return res.status(404).json({ error: 'Mission introuvable' });
 
-    if (missionRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Mission introuvable' });
-    }
+    // Vérifier plafond
+    await checkCashworkInvoiceLimit(mRes.rows[0].category, parseInt(amount));
 
-    const mission = missionRes.rows[0];
+    await query(`UPDATE cash_work_missions SET invoice_amount=$1,status='invoice_sent' WHERE id=$2`, [amount, req.params.id]);
 
-    await query(
-      `UPDATE cash_work_missions SET invoice_amount = $1, status = 'invoice_sent' WHERE id = $2`,
-      [amount, id]
-    );
+    await sendWhatsApp(mRes.rows[0].cwha||mRes.rows[0].cp,
+      `📄 Facture reçue : ${parseInt(amount).toLocaleString()} FCFA\n\n⚠️ RAPPEL : Acceptez uniquement via Play16. Tout paiement hors plateforme vous engage seul.`
+    ).catch(()=>{});
 
-    // Notifier le client
-    await sendWhatsApp(
-      mission.client_whatsapp || mission.client_phone,
-      `📄 Facture reçue pour votre mission Cash-Work !\nMontant : ${amount} FCFA\nOuvrez Play16 pour accepter ou renégocier.\n⚠️ RAPPEL : Tout paiement doit se faire via Play16 pour que les deux parties soient protégées.`
-    );
-
-    res.json({ success: true, amount });
+    res.json({ success:true, amount });
   } catch (err) {
-    console.error('[CashWork] Erreur facture:', err.message);
-    res.status(500).json({ error: 'Erreur soumission facture' });
+    if (err.message.includes('trop élevé')) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: 'Erreur facture' });
   }
 });
 
-// ── ACCEPTER LA FACTURE + SÉQUESTRE (Client) ─────────────────
-// POST /api/cashwork/missions/:id/accept-invoice
+// ── ACCEPTER FACTURE + SÉQUESTRE ─────────────────────────────
 router.post('/missions/:id/accept-invoice', authClient, async (req, res) => {
   try {
-    const { id } = req.params;
-    const clientId = req.user.id;
-
-    const missionRes = await query(
-      `SELECT cm.*, u.phone_number as client_phone, u.whatsapp_number as client_whatsapp,
-              uw.whatsapp_number as worker_whatsapp, uw.phone_number as worker_phone,
-              uw.full_name as worker_name
-       FROM cash_work_missions cm
-       JOIN users u ON u.id = cm.client_id
-       JOIN users uw ON uw.id = cm.worker_id
-       WHERE cm.id = $1 AND cm.client_id = $2 AND cm.status = 'invoice_sent'`,
-      [id, clientId]
+    const mRes = await query(
+      `SELECT cm.*,uc.phone_number as cp,uw.whatsapp_number as wwha,uw.phone_number as wp
+       FROM cash_work_missions cm JOIN users uc ON uc.id=cm.client_id
+       JOIN users uw ON uw.id=cm.worker_id
+       WHERE cm.id=$1 AND cm.client_id=$2 AND cm.status='invoice_sent'`,
+      [req.params.id, req.user.id]
     );
+    if (!mRes.rows[0]) return res.status(404).json({ error: 'Mission introuvable' });
+    const m = mRes.rows[0];
 
-    if (missionRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Mission introuvable' });
-    }
+    const pay = await charge({ phoneNumber:m.cp, amount:m.invoice_amount, description:`Séquestre CW ${req.params.id.slice(0,8)}`, internalReference:`cw-${req.params.id}` });
+    if (!pay.success && !pay.simulated) return res.status(402).json({ error: 'Paiement échoué' });
 
-    const mission = missionRes.rows[0];
+    await query(`UPDATE cash_work_missions SET status='escrowed',escrowed_at=now() WHERE id=$1`, [req.params.id]);
+    await sendWhatsApp(m.wwha||m.wp,
+      `🔐 ${m.invoice_amount?.toLocaleString()} FCFA séquestrés. Vous pouvez commencer le travail.\n\n⚠️ Accepter un paiement hors Play16 = fraude = bannissement possible.`
+    ).catch(()=>{});
 
-    // Initier le paiement (séquestre)
-    const paymentResult = await charge({
-      phoneNumber: mission.client_phone,
-      amount: mission.invoice_amount,
-      description: `Séquestre Cash-Work — Mission ${id.slice(0,8).toUpperCase()}`,
-      internalReference: `cw-${id}`,
-    });
-
-    if (paymentResult.success || paymentResult.simulated) {
-      await query(
-        `UPDATE cash_work_missions SET status = 'escrowed', escrowed_at = now() WHERE id = $1`,
-        [id]
-      );
-
-      // Notifier le prestataire
-      await sendWhatsApp(
-        mission.worker_whatsapp || mission.worker_phone,
-        `🔐 Fonds séquestrés ! ${mission.invoice_amount} FCFA sont sécurisés chez Play16.\nVous pouvez commencer le travail. Les fonds seront libérés après validation du client.\n⚠️ IMPORTANT : Accepter un paiement en dehors de la plateforme est considéré comme une fraude et peut entraîner votre bannissement.`
-      );
-
-      res.json({
-        success: true,
-        escrowed_amount: mission.invoice_amount,
-        message: 'Fonds séquestrés. Le prestataire peut commencer le travail.',
-      });
-    } else {
-      res.status(402).json({ error: 'Paiement échoué' });
-    }
-  } catch (err) {
-    console.error('[CashWork] Erreur séquestre:', err.message);
-    res.status(500).json({ error: 'Erreur séquestre' });
-  }
+    res.json({ success:true, escrowed_amount:m.invoice_amount });
+  } catch (err) { res.status(500).json({ error: 'Erreur séquestre' }); }
 });
 
-// ── VALIDER LE TRAVAIL + LIBÉRER LES FONDS (Client) ─────────
-// POST /api/cashwork/missions/:id/validate
+// ── VALIDER MISSION ──────────────────────────────────────────
 router.post('/missions/:id/validate', authClient, async (req, res) => {
   try {
-    const { id } = req.params;
-    const clientId = req.user.id;
-
-    const missionRes = await query(
-      `SELECT cm.*, u.whatsapp_number as worker_whatsapp, u.phone_number as worker_phone
-       FROM cash_work_missions cm
-       JOIN users u ON u.id = cm.worker_id
-       WHERE cm.id = $1 AND cm.client_id = $2 AND cm.status IN ('escrowed', 'submitted')`,
-      [id, clientId]
+    const mRes = await query(
+      `SELECT cm.*,uw.whatsapp_number as wwha,uw.phone_number as wp
+       FROM cash_work_missions cm JOIN users uw ON uw.id=cm.worker_id
+       WHERE cm.id=$1 AND cm.client_id=$2 AND cm.status IN ('escrowed','submitted')`,
+      [req.params.id, req.user.id]
     );
+    if (!mRes.rows[0]) return res.status(404).json({ error: 'Mission introuvable' });
+    const m = mRes.rows[0];
+    const commission = Math.round(m.invoice_amount * parseFloat(m.commission_rate) / 100);
+    const workerAmt  = m.invoice_amount - commission;
 
-    if (missionRes.rows.length === 0) {
-      return res.status(404).json({ error: 'Mission introuvable' });
-    }
+    await query(`UPDATE cash_work_missions SET status='validated',validated_at=now() WHERE id=$1`, [req.params.id]);
+    await sendWhatsApp(m.wwha||m.wp,
+      `✅ Mission validée ! ${workerAmt.toLocaleString()} FCFA seront versés sous 1h. (Commission Play16: ${commission.toLocaleString()} FCFA)`
+    ).catch(()=>{});
 
-    const mission = missionRes.rows[0];
-    const commissionRate = parseFloat(mission.commission_rate) / 100;
-    const commission = Math.round(mission.invoice_amount * commissionRate);
-    const workerAmount = mission.invoice_amount - commission;
-
-    await query(
-      `UPDATE cash_work_missions SET status = 'validated', validated_at = now() WHERE id = $1`,
-      [id]
-    );
-
-    // Notifier le prestataire du versement
-    await sendWhatsApp(
-      mission.worker_whatsapp || mission.worker_phone,
-      `✅ Mission validée ! ${workerAmount} FCFA vont être versés sur votre compte dans l\'heure.\n(Commission Play16 : ${commission} FCFA — ${mission.commission_rate}%)`
-    );
-
-    res.json({
-      success: true,
-      worker_amount: workerAmount,
-      commission,
-      message: 'Mission validée. Fonds libérés au prestataire.',
-    });
-  } catch (err) {
-    console.error('[CashWork] Erreur validation:', err.message);
-    res.status(500).json({ error: 'Erreur validation mission' });
-  }
+    res.json({ success:true, worker_amount:workerAmt, commission });
+  } catch (err) { res.status(500).json({ error: 'Erreur validation' }); }
 });
 
-// ── RELANCE AUTOMATIQUE 24H (appelé par un cron job) ────────
-// POST /api/cashwork/posts/remind-expired
+// ── RELANCE AUTO 24H ─────────────────────────────────────────
 router.post('/posts/remind-expired', authAdmin, async (req, res) => {
   try {
-    const thresholdRes = await query(
-      `SELECT value FROM platform_settings WHERE key = 'cashwork_post_reminder_hours'`
+    const r = await query(
+      `SELECT cp.*,u.whatsapp_number,u.phone_number FROM cash_work_posts cp
+       JOIN users u ON u.id=cp.posted_by_user_id
+       WHERE cp.status='open' AND cp.created_at < now()-INTERVAL '24 hours'
+       AND (cp.last_reminder_sent_at IS NULL OR cp.last_reminder_sent_at < now()-INTERVAL '24 hours')`
     );
-    const hours = parseInt(thresholdRes.rows[0]?.value || '24');
-
-    const expiredPosts = await query(
-      `SELECT cp.*, u.whatsapp_number, u.phone_number
-       FROM cash_work_posts cp
-       JOIN users u ON u.id = cp.posted_by_user_id
-       WHERE cp.status = 'open'
-         AND cp.created_at < now() - INTERVAL '${hours} hours'
-         AND (cp.last_reminder_sent_at IS NULL
-              OR cp.last_reminder_sent_at < now() - INTERVAL '${hours} hours')`,
-      []
-    );
-
-    let reminded = 0;
-    for (const post of expiredPosts.rows) {
-      await sendWhatsApp(
-        post.whatsapp_number || post.phone_number,
-        `⏰ Rappel Play16 : Votre annonce Cash-Work "${post.description.slice(0, 60)}..." n\'a pas encore trouvé de prestataire.\nOuvrez l\'application pour la réactiver, modifier ou annuler.`
-      );
-      await query(
-        `UPDATE cash_work_posts SET last_reminder_sent_at = now() WHERE id = $1`,
-        [post.id]
-      );
+    let reminded=0;
+    for (const p of r.rows) {
+      await sendWhatsApp(p.whatsapp_number||p.phone_number,
+        `⏰ Votre annonce Cash-Work "${p.description.slice(0,60)}..." n'a pas encore de prestataire. Ouvrez Play16 pour la réactiver.`
+      ).catch(()=>{});
+      await query(`UPDATE cash_work_posts SET last_reminder_sent_at=now() WHERE id=$1`, [p.id]);
       reminded++;
     }
-
-    res.json({ success: true, reminded });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur relance annonces' });
-  }
+    res.json({ success:true, reminded });
+  } catch (err) { res.status(500).json({ error: 'Erreur relance' }); }
 });
-
-// ── HELPERS ─────────────────────────────────────────────────
-function detectCategory(description) {
-  const desc = description.toLowerCase();
-  if (desc.match(/nettoyage|ménage|balayer|laver/)) return 'Nettoyage';
-  if (desc.match(/électri|câble|courant|prise|interrupteur/)) return 'Électricité';
-  if (desc.match(/plomberie|tuyau|robinet|fuite|wc|toilette/)) return 'Plomberie';
-  if (desc.match(/peinture|peindre|badigeonner/)) return 'Peinture';
-  if (desc.match(/informatique|ordinateur|téléphone|réseau|wifi/)) return 'Informatique';
-  if (desc.match(/déménage|transport|porter|déplacer/)) return 'Déménagement';
-  if (desc.match(/jardinage|gazon|plante|arbre|herbe/)) return 'Jardinage';
-  if (desc.match(/cuisine|chef|repas|manger|traiteur/)) return 'Cuisine';
-  if (desc.match(/livraison|colis|course|commission/)) return 'Livraison';
-  return 'Divers';
-}
-
-async function findAvailableWorkers(category, lat, lng) {
-  const result = await query(
-    `SELECT u.id, u.phone_number, u.whatsapp_number, u.full_name
-     FROM users u
-     WHERE u.is_cash_worker = TRUE
-     LIMIT 5`
-  );
-  return result.rows;
-}
 
 module.exports = router;
