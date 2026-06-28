@@ -1,11 +1,10 @@
 // ============================================================
-// PLAY16 — Routes Auth (version sécurisée)
+// PLAY16 — Routes Auth (corrigé — Super Admin sans OTP)
 // ============================================================
 const express = require('express');
 const router  = express.Router();
 const jwt     = require('jsonwebtoken');
 const bcrypt  = require('bcrypt');
-const crypto  = require('crypto');
 const { query }    = require('./pool');
 const { sendOTP, verifyOTP } = require('./otpService');
 const {
@@ -19,21 +18,25 @@ router.post('/request-otp', async (req, res) => {
     const { phone_number } = req.body;
     if (!phone_number) return res.status(400).json({ error: 'Numéro requis' });
 
-    // Rate limiting OTP
-    await checkOTPRateLimit(phone_number);
-
+    // Créer le compte si premier accès
     await query(
       `INSERT INTO users (phone_number) VALUES ($1) ON CONFLICT (phone_number) DO NOTHING`,
       [phone_number]
     );
 
-    const result = await sendOTP(phone_number);
-    if (result.simulated) console.log(`[OTP SIM] Code pour ${maskSensitive(phone_number)}`);
+    // Rate limiting OTP (seulement si la table existe)
+    try { await checkOTPRateLimit(phone_number); } catch(rl) {
+      return res.status(429).json({ error: rl.message });
+    }
 
+    const result = await sendOTP(phone_number);
+    if (result.simulated) {
+      console.log(`[OTP SIM] Code pour ${maskSensitive(phone_number)} visible dans les logs Railway`);
+    }
     res.json({ success: true, simulated: result.simulated });
   } catch (err) {
-    console.error('[Auth] request-otp:', maskSensitive(err.message));
-    res.status(429).json({ error: err.message });
+    console.error('[Auth] request-otp:', err.message);
+    res.status(500).json({ error: 'Erreur envoi OTP' });
   }
 });
 
@@ -43,28 +46,19 @@ router.post('/verify-otp', async (req, res) => {
     const { phone_number, code } = req.body;
     if (!phone_number || !code) return res.status(400).json({ error: 'Données manquantes' });
 
-    // Vérifier OTP avec gestion des tentatives
-    let valid;
-    try {
-      valid = await verifyOTP(phone_number, code);
-    } catch (otpErr) {
-      return res.status(401).json({ error: otpErr.message });
-    }
-
+    const valid = await verifyOTP(phone_number, code);
     if (!valid) {
-      await recordOTPFailure(phone_number);
+      try { await recordOTPFailure(phone_number); } catch(e) {}
       return res.status(401).json({ error: 'Code invalide ou expiré' });
     }
 
-    // Succès → effacer les tentatives
-    await clearOTPAttempts(phone_number);
+    try { await clearOTPAttempts(phone_number); } catch(e) {}
 
     const userRes = await query(`SELECT * FROM users WHERE phone_number=$1`, [phone_number]);
     const user = userRes.rows[0];
 
     const cguRes = await query(`SELECT MAX(version_number) as latest FROM cgu_versions WHERE module='global'`);
     const latestCGU = cguRes.rows[0]?.latest || 0;
-    const needsCGU  = user.cgu_accepted_version < latestCGU;
 
     const token = jwt.sign(
       { id: user.id, phone: user.phone_number, type: 'client' },
@@ -78,9 +72,9 @@ router.post('/verify-otp', async (req, res) => {
         id: user.id, phone_number: user.phone_number, full_name: user.full_name,
         is_supplier: user.is_supplier, is_cash_worker: user.is_cash_worker,
         supplier_verified: user.supplier_verified, cashback_balance: user.cashback_balance,
-        two_fa_enabled: user.two_fa_enabled,
       },
-      needs_cgu_acceptance: needsCGU, cgu_version: latestCGU,
+      needs_cgu_acceptance: user.cgu_accepted_version < latestCGU,
+      cgu_version: latestCGU,
     });
   } catch (err) {
     console.error('[Auth] verify-otp:', err.message);
@@ -88,18 +82,9 @@ router.post('/verify-otp', async (req, res) => {
   }
 });
 
-// ── CLIENT : Déconnexion (révocation JWT) ────────────────────
-router.post('/logout', async (req, res) => {
-  try {
-    const token = req.headers.authorization?.split(' ')[1];
-    if (token) await blacklistToken(token, 'logout');
-    res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur déconnexion' });
-  }
-});
-
-// ── ADMIN : Login ────────────────────────────────────────────
+// ── ADMIN : Login (mot de passe uniquement) ──────────────────
+// RÈGLE : Super Admin → connexion directe par mot de passe, PAS d'OTP
+//         Sous-admins → mot de passe + OTP WhatsApp (2FA)
 router.post('/admin-login', async (req, res) => {
   try {
     const { whatsapp_number, password } = req.body;
@@ -109,28 +94,51 @@ router.post('/admin-login', async (req, res) => {
       `SELECT * FROM admin_accounts WHERE whatsapp_number=$1 AND is_active=TRUE`,
       [whatsapp_number]
     );
-    const admin = adminRes.rows[0];
 
-    // Délai constant (empêche timing attack)
+    // Délai constant anti timing-attack
     const dummyHash = '$2b$12$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+    const admin = adminRes.rows[0];
     const validPassword = admin
       ? await bcrypt.compare(password, admin.password_hash)
       : await bcrypt.compare(password, dummyHash);
 
     if (!admin || !validPassword) {
-      // Alerte si trop d'échecs
-      if (admin) {
-        await createFraudAlert(null, 'ADMIN_LOGIN_FAILURE', 'high',
-          `Échec connexion admin: ${maskSensitive(whatsapp_number)}`);
-      }
       return res.status(401).json({ error: 'Identifiants incorrects' });
     }
 
-    // Envoyer OTP 2FA
-    await checkOTPRateLimit(whatsapp_number);
+    // ── SUPER ADMIN : connexion directe, pas d'OTP ───────────
+    if (admin.role === 'super_admin') {
+      const token = jwt.sign(
+        { id: admin.id, role: admin.role, whatsapp: whatsapp_number,
+          extended_access: true, type: 'admin' },
+        process.env.JWT_SECRET,
+        { expiresIn: '12h' }
+      );
+
+      // Créer session
+      await query(
+        `INSERT INTO admin_sessions (admin_id, whatsapp_number_used, ip_address)
+         VALUES ($1,$2,$3)`, [admin.id, whatsapp_number, req.ip]
+      );
+
+      return res.json({
+        success: true,
+        requires_2fa: false,
+        token,
+        admin: {
+          id: admin.id, full_name: admin.full_name, role: admin.role,
+          extended_access: true, must_change_password: admin.must_change_password,
+        },
+      });
+    }
+
+    // ── SOUS-ADMINS : OTP 2FA requis ─────────────────────────
+    try { await checkOTPRateLimit(whatsapp_number); } catch(rl) {
+      return res.status(429).json({ error: rl.message });
+    }
+
     const otpResult = await sendOTP(whatsapp_number);
 
-    // Créer session admin
     const sessionRes = await query(
       `INSERT INTO admin_sessions (admin_id, whatsapp_number_used, ip_address)
        VALUES ($1,$2,$3) RETURNING id`,
@@ -138,8 +146,10 @@ router.post('/admin-login', async (req, res) => {
     );
 
     res.json({
-      success: true, requires_2fa: true,
-      admin_id: admin.id, session_id: sessionRes.rows[0].id,
+      success: true,
+      requires_2fa: true,
+      admin_id: admin.id,
+      session_id: sessionRes.rows[0].id,
       must_change_password: admin.must_change_password,
       simulated: otpResult.simulated,
     });
@@ -149,24 +159,18 @@ router.post('/admin-login', async (req, res) => {
   }
 });
 
-// ── ADMIN : Vérifier 2FA ─────────────────────────────────────
+// ── ADMIN : Vérifier 2FA (sous-admins uniquement) ────────────
 router.post('/admin-verify-2fa', async (req, res) => {
   try {
     const { admin_id, whatsapp_number, code, session_id } = req.body;
 
-    let valid;
-    try {
-      valid = await verifyOTP(whatsapp_number, code);
-    } catch (err) {
-      return res.status(401).json({ error: err.message });
-    }
-
+    const valid = await verifyOTP(whatsapp_number, code);
     if (!valid) {
-      await recordOTPFailure(whatsapp_number);
+      try { await recordOTPFailure(whatsapp_number); } catch(e) {}
       return res.status(401).json({ error: 'Code 2FA invalide ou expiré' });
     }
 
-    await clearOTPAttempts(whatsapp_number);
+    try { await clearOTPAttempts(whatsapp_number); } catch(e) {}
 
     const adminRes = await query(`SELECT * FROM admin_accounts WHERE id=$1`, [admin_id]);
     const admin = adminRes.rows[0];
@@ -175,10 +179,10 @@ router.post('/admin-verify-2fa', async (req, res) => {
     const token = jwt.sign(
       { id: admin.id, role: admin.role, whatsapp: whatsapp_number,
         extended_access: admin.extended_access, type: 'admin', session_id },
-      process.env.JWT_SECRET, { expiresIn: '12h' }
+      process.env.JWT_SECRET,
+      { expiresIn: '12h' }
     );
 
-    // Mettre à jour session
     await query(`UPDATE admin_sessions SET started_at=now() WHERE id=$1`, [session_id]);
 
     res.json({
@@ -194,24 +198,24 @@ router.post('/admin-verify-2fa', async (req, res) => {
   }
 });
 
-// ── ADMIN : Déconnexion ──────────────────────────────────────
+// ── DÉCONNEXION ──────────────────────────────────
+router.post('/logout', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) { try { await blacklistToken(token, 'logout'); } catch(e) {} }
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: 'Erreur déconnexion' }); }
+});
+
 router.post('/admin-logout', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
-    if (token) {
-      await blacklistToken(token, 'admin_logout', req.admin?.id);
-      // Fermer la session
-      if (req.admin?.session_id) {
-        await query(`UPDATE admin_sessions SET ended_at=now() WHERE id=$1`, [req.admin.session_id]);
-      }
-    }
+    if (token) { try { await blacklistToken(token, 'admin_logout'); } catch(e) {} }
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur déconnexion admin' });
-  }
+  } catch (err) { res.status(500).json({ error: 'Erreur déconnexion admin' }); }
 });
 
-// ── ACCEPTER CGU ─────────────────────────────────────────────
+// ── ACCEPTER CGU ─────────────────────────────────
 router.post('/accept-cgu', async (req, res) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -223,9 +227,7 @@ router.post('/accept-cgu', async (req, res) => {
       [version, decoded.id]
     );
     res.json({ success: true });
-  } catch (err) {
-    res.status(500).json({ error: 'Erreur acceptation CGU' });
-  }
+  } catch (err) { res.status(500).json({ error: 'Erreur acceptation CGU' }); }
 });
 
 module.exports = router;
