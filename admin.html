@@ -604,7 +604,8 @@ for(let i=0;i<movs.length;i++){
   movs[i].addEventListener('click',function(e){if(e.target===this)this.classList.remove('open');});
 }
 
-if(TOK&&ME){initApp();}
+window.onerror=function(msg,url,line){document.body.innerHTML='<div style="padding:30px;font-family:monospace;background:#FEF2F2;color:#DC2626"><h3>Erreur JavaScript</h3><p>'+msg+'</p><p>Ligne: '+line+'</p><button onclick="localStorage.clear();location.reload()" style="margin-top:20px;padding:12px 20px;background:#7C3AED;color:#fff;border:none;border-radius:8px">Reinitialiser et recharger</button></div>';return true;};
+if(TOK&&ME){try{initApp();}catch(e){document.body.innerHTML='<div style="padding:30px;font-family:monospace;background:#FEF2F2;color:#DC2626"><h3>Erreur au demarrage</h3><p>'+e.message+'</p><button onclick="localStorage.clear();location.reload()" style="margin-top:20px;padding:12px 20px;background:#7C3AED;color:#fff;border:none;border-radius:8px">Reinitialiser et recharger</button></div>';}}
 </script>
 </body>
 </html>
